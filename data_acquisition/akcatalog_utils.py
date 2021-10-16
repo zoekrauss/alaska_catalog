@@ -7,6 +7,7 @@ import time; import datetime
 from obspy.core.utcdatetime import UTCDateTime
 from obspy.clients.fdsn.client import Client
 import pyasdf
+import scipy.fftpack
 
 def read_files(base_folder,use_quakeml=False):
     ''' 
@@ -58,12 +59,13 @@ def read_files(base_folder,use_quakeml=False):
     
     return(assoc,arrivals,origin)
 
-def calc_snr(stream,sampleind,phase):
+def calc_snr(data,sampleind,sr,phase):
     """
     # Calculate SNR of arrival
     # INPUTS:
-    # stream = obspy-formatted waveform object
-    # sampleind = index in the stream's data of desired arrival for which to calculate SNR
+    # data = seismic data in a vector; such as trace.data from an obspy stream
+    # sampleind = index in the data of desired arrival for which to calculate SNR
+    # sr = sampling rate of data
     # phase = type of arrival as a string, either 'P' or 'S'
     #
     # OUTPUT:
@@ -76,8 +78,7 @@ def calc_snr(stream,sampleind,phase):
     if phase == 'S':
         window = [5,5]
     try:
-        data = stream[0].data
-        sr = int(stream[0].stats.sampling_rate)
+        sr = int(sr)
         snr_num = max(abs(data[sampleind:(sampleind+(window[0]*sr))]))
         snr_denom = np.sqrt(np.mean((data[(sampleind-(window[1]*sr)):sampleind])**2))
         snr = snr_num/snr_denom
@@ -133,20 +134,68 @@ def remove_compliance(st):
     st.resample(100)
 
     # Make sure all traces are the same length:
-    for trace in st:
-        if trace.stats.npts != 132000:
-            trace.trim(starttime = trace.stats.starttime,endtime = trace.stats.endtime-(.01*(trace.stats.npts-132000)))
-
-    n2 = st[3].stats.npts
-    f = np.fft.rfftfreq(n2,1/st[3].stats.sampling_rate)
-    ftZ = np.fft.fft(st[3].data,n=n2)
-    ftP = np.fft.fft(st[0].data,n=n2)
+    if (min(tr.stats.npts for tr in st)==max(tr.stats.npts for tr in st))==False:
+        for tr in st:
+            tr.data = tr.data[:min(tr.stats.npts for tr in st)]
+    
+    zchan = st.select(channel='*Z')
+    pchan = st.select(channel='*H')
+    n2 = zchan[0].stats.npts
+    f = np.fft.rfftfreq(n2,1/zchan[0].stats.sampling_rate)
+    ftZ = np.fft.fft(zchan[0].data,n=n2)
+    ftP = np.fft.fft(pchan[0].data,n=n2)
     cZZ = np.abs(ftZ*np.conj(ftZ))
     cPP = np.abs(ftP * np.conj(ftP))
     cPZ = np.abs(np.conj(ftP)*ftZ)
     transPZ = cPZ / cPP
     zcorr_spec = ftZ - (ftP * transPZ)
     zcorr = np.fft.ifft(zcorr_spec)
+    
+    # Coherence:
+    coh = ((cPZ)**2)/(cZZ * cPP)
 
 
-    return zcorr 
+    return zcorr,coh
+
+def plot_fourier(st,zcorr):
+    """
+    Plots a 2x2 figure comparing the spectra of raw and compliance-corrected vertical channels
+    
+    Inputs:
+    st = raw obspy stream object
+    zcorr = vector of seismic data representing the corrected raw vertical data from st
+    
+    Outputs:
+    fig = figure object 
+    """
+    
+    %matplotlib inline
+    fig, axs = plt.subplots(2, 2)
+    print('station = '+st[0].stats.station+', '+'depth = '+str(elev))
+    axs[0,0].specgram(st[3],Fs=100,vmin=0,vmax=100)
+    axs[0,0].title.set_text('Raw Vertical Channel')
+    axs[0,0].set_xlabel('Time(s)');
+    axs[0,0].set_ylabel('Frequency (Hz)')
+    axs[1,0].specgram(np.real(zcorr),Fs=100,vmin=0,vmax=100)
+    axs[1,0].title.set_text('Compliance-corrected Vertical Channel')
+    axs[1,0].set_xlabel('Time (s)')
+    axs[1,0].set_ylabel('Frequency (Hz)')
+
+    # Number of samplepoints
+    N = 132000
+    # sample spacing
+    T = 1.0 / 100.0
+    xf = np.linspace(int(0.0), int(1.0/(2.0*T)), int(N/2))
+
+
+    y = st[3]
+    yf = scipy.fftpack.fft(y)
+    axs[0,1].plot(xf, 2.0/N * np.abs(yf[:N//2]))
+    axs[0,1].title.set_text('Fourier Transform: Raw Vertical Channel')
+    axs[0,1].set_xlabel('Frequency (Hz)');
+    y = zcorr
+    yf = scipy.fftpack.fft(y)
+    axs[1,1].plot(xf, 2.0/N * np.abs(yf[:N//2]))
+    axs[1,1].title.set_text('Fourier Transform: Compliance-corrected Vertical Channel')
+    axs[1,1].set_xlabel('Frequency (Hz)');
+    return fig
